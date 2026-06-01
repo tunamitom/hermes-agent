@@ -96,6 +96,7 @@ _CAPABILITY_ENDPOINTS = (
     ("session_chat", ("POST", "/api/sessions/{session_id}/chat")),
     ("session_chat_stream", ("POST", "/api/sessions/{session_id}/chat/stream")),
     ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")),
+    ("session_compress", ("POST", "/api/sessions/{session_id}/compress")),
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
@@ -141,8 +142,8 @@ from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
-    MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
-    validate_media_delivery_path)
+    MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, MessageEvent, MessageType, SendResult,
+    _terminal_sentinel_start, is_network_accessible, validate_media_delivery_path)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.i18n import t
 from agent.redact import redact_sensitive_text
@@ -1770,6 +1771,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/api/sessions/{session_id}/compress", self._handle_session_compress),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3592,6 +3594,67 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return response
 
     @_admit_api_agent_request
+    async def _handle_session_compress(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/compress — manual context compression for kanban's
+        "Take a breather" button. Thin bridge: resolve the session's live SessionSource and inject
+        a synthetic ``/compress`` MessageEvent into the gateway's real message pipeline
+        (``runner._handle_message``) so the EXACT slash-command path runs — busy-session gating,
+        profile scoping, codex_app_server handling, transcript rotation. A parallel
+        LLM-summarization copy rots (the pre-v0.21 route did, and died with the rebase); routing
+        through the pipeline keeps one source of truth. The reply string is returned to the
+        caller; this adapter holds no chat transport, so nothing is sent to the underlying chat."""
+        session_id = request.match_info["session_id"]
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if runner is None:
+            return _error_response("Gateway runner unavailable", 503, code="gateway_unavailable")
+        entry = await asyncio.to_thread(runner.session_store.lookup_by_session_id, session_id)
+        if entry is None or entry.origin is None:
+            return _error_response(f"No live session found for id: {session_id}", 404,
+                                   code="session_not_live")
+        # Body mirrors the slash args: "here [N]" partial form and/or a focus topic string.
+        # Empty/non-JSON body is a plain full compress — _read_json_body's 400 would be wrong.
+        body, body_err = await self._read_json_body(request)
+        if body_err is not None and request.can_read_body:
+            return body_err
+        args = " ".join(str(body.get(k) or "").strip() for k in ("mode", "focus")
+                        if str(body.get(k) or "").strip()).strip()
+        event = MessageEvent(text=f"/compress {args}".strip(), message_type=MessageType.TEXT,
+                             source=entry.origin, allow_gateway_control=True)
+        reply = await runner._handle_message(event)
+        if not isinstance(reply, str):
+            reply = str(reply or "")
+        # Fresh context size for the usage pill (same rough estimator /usage would use).
+        # Prefer the value the pipeline just persisted: manual /compress stores its
+        # post-compression request-size estimate in ``last_prompt_tokens`` (the reply quotes
+        # the same number), so the pill matches the reply for EVERY profile. The history
+        # estimate is only the fallback — computed under the session's profile home override,
+        # since a multiplexed profile session's transcript lives in its own state.db and the
+        # unscoped lookup reads the default home's, coming up empty.
+        context_tokens = None
+        try:
+            fresh = int(getattr(entry, "last_prompt_tokens", 0) or 0)
+            if fresh > 0:
+                context_tokens = fresh
+        except Exception:
+            logger.debug("post-compress store read failed for %s", session_id, exc_info=True)
+        if context_tokens is None:
+            try:
+                from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+                home_token = set_hermes_home_override(str(runner._resolve_profile_home_for_source(entry.origin)))
+                try:
+                    history = await self._conversation_history_for_session(entry.session_id)
+                finally:
+                    reset_hermes_home_override(home_token)
+                if history:
+                    from agent.model_metadata import estimate_request_tokens_rough
+                    context_tokens = estimate_request_tokens_rough(history)
+            except Exception:
+                logger.debug("post-compress token estimate failed for %s", session_id, exc_info=True)
+        payload: Dict[str, Any] = {"ok": True, "reply": reply, "session_id": entry.session_id}
+        if context_tokens is not None:
+            payload["contextTokens"] = context_tokens
+        return web.json_response(payload, headers=self._session_headers(entry.session_id, None))
+
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""

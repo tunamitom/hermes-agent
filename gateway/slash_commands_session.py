@@ -568,7 +568,8 @@ class GatewaySessionCommandsMixin:
                 return t("gateway.compress.nothing_to_do")
             if result.status != "compressed":
                 return "\n".join(render_compress_result(result))
-            await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages)
+            await self._persist_manual_compression(tmp_agent, session_entry, source, result.after_messages,
+                                                  result.after_tokens)
             finalize_context_engine_compression_notification(tmp_agent, committed=True)
             compressor = tmp_agent.context_compressor
             summary = result.summary
@@ -619,12 +620,16 @@ class GatewaySessionCommandsMixin:
         tmp_agent._end_session_on_close = False
         return tmp_agent
 
-    async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed) -> None:
+    async def _persist_manual_compression(self, tmp_agent, session_entry, source, compressed,
+                                          after_tokens: int = 0) -> None:
         """Commit a manual /compress result to the session store.  Rotation (new continuation id)
         makes the NEW session durable (already published, else rewritten) so the original stays searchable;
         persist BEFORE repointing so a failed write is fatal and old history stays reachable.
         In-place compaction already archived + inserted rows, and a rewrite would DELETE the
-        archive; an unchanged id without in-place means rotation FAILED."""
+        archive; an unchanged id without in-place means rotation FAILED.
+        ``after_tokens`` is the post-compression request-size estimate the reply quotes — storing
+        it (not 0) keeps the kanban usage pill showing the real context window until the next
+        live turn overwrites it with actual API usage."""
         new_session_id = tmp_agent.session_id
         if new_session_id != session_entry.session_id:
             # Published child is already durable; a rewrite would drop rows cloned at publish.
@@ -639,7 +644,8 @@ class GatewaySessionCommandsMixin:
             logger.warning(
                 "Manual /compress: session rotation did not occur (session_id unchanged) and in-place "
                 "mode is off — preserving original transcript instead of overwriting it (#44794).")
-        await self.async_session_store.update_session(session_entry.session_key, last_prompt_tokens=0)
+        await self.async_session_store.update_session(
+            session_entry.session_key, last_prompt_tokens=max(int(after_tokens or 0), 0))
 
     # ------------------------------------------------------------------------ /topic
 

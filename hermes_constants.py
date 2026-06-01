@@ -1409,3 +1409,53 @@ def normalize_scope(scope: str | Path | None) -> str | None:
     """
     return hermes_home_key(scope) if scope is not None else None
 
+
+
+def _load_network_env() -> None:
+    """Load shared network env vars from ~/.hermes/network.env.
+
+    Parses ``KEY=value`` lines (skipping comments and blank lines) and
+    injects them into ``os.environ``.  Variables that are already set in
+    the environment are NOT overridden — this preserves explicit
+    per-profile or per-invocation overrides.
+
+    Called early in ``start_gateway()`` so that downstream code
+    (config.yaml ``${VAR}`` expansion, skills, terminal subprocesses)
+    can reference hostnames like ``$BLACKBOX_HOST`` without manual
+    sourcing.
+
+    For profiles, ``get_hermes_home()`` returns the profile directory
+    (e.g. ``~/.hermes/profiles/tifa/``).  We also check the shared
+    ``~/.hermes/network.env`` as a fallback so that all profiles
+    inherit the same network configuration.
+    """
+    paths = [get_hermes_home() / "network.env"]
+    # Also check the shared ~/.hermes/ path when running under a profile
+    # (profile's get_hermes_home() != ~/.hermes/).
+    shared = Path.home() / ".hermes" / "network.env"
+    if shared not in paths:
+        paths.append(shared)
+    for env_path in paths:
+        if not env_path.is_file():
+            continue
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip()
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception:
+            # Best-effort — don't crash gateway startup over network env.
+            pass
+
+
+# Load network env at import time so config.yaml ${VAR} expansion works
+# even when called outside the gateway (e.g. CLI, child process spawner).
+_load_network_env()

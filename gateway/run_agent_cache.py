@@ -193,11 +193,54 @@ class GatewayAgentCacheMixin:
             session_key, override.get("model"), provider or "",
         )
 
-    def _apply_session_model_override(self, session_key: str, model: str, runtime_kwargs: dict) -> tuple:
+    def _load_session_models_file_override(self, session_key: str) -> Optional[Dict[str, str]]:
+        """Read a per-session model override from session_models.json.
+
+        The kanban app's model selector persists choices to
+        ``~/.hermes/session_models.json``.  The gateway's in-memory
+        ``_session_model_overrides`` (populated by the /model slash command)
+        is the primary source, but it is lost on restart and only exists for
+        sessions that switched via the in-chat command.  This method provides
+        a file-based fallback so kanban-app model selections survive gateway
+        restarts and apply to sessions that never used /model.
+
+        Entries older than 7 days are ignored.
+        """
+        if not session_key:
+            return None
+        try:
+            import json as _json
+            from hermes_constants import get_hermes_home
+            _sm_path = get_hermes_home() / "session_models.json"
+            if not _sm_path.exists():
+                return None
+            _data = _json.loads(_sm_path.read_text(encoding="utf-8"))
+            _entry = _data.get(session_key)
+            if not _entry:
+                return None
+            # Expire after 7 days — matches the kanban app's own TTL.
+            _updated = _entry.get("updatedAt", 0)
+            if _updated and (time.time() * 1000 - _updated) > 7 * 24 * 60 * 60 * 1000:
+                return None
+            # Only carry fields the override system understands.
+            return {
+                k: _entry[k]
+                for k in ("model", "provider", "base_url", "api_key", "api_mode", "max_tokens")
+                if k in _entry and _entry[k]
+            }
+        except Exception:
+            return None
+
+    def _apply_session_model_override(self, session_key: str, model: str, runtime_kwargs: dict,
+                                      override: Optional[Dict[str, str]] = None) -> tuple:
         """Apply /model session overrides (precedence over config.yaml defaults; ``None`` fields skipped
-        so partial overrides don't clobber defaults), returning (model, runtime_kwargs)."""
+        so partial overrides don't clobber defaults), returning (model, runtime_kwargs).
+
+        ``override`` supplies the override directly (kanban's session_models.json file fallback);
+        defaults to the in-memory /model override."""
         from gateway.run import _credential_pool_for_provider
-        override = self._session_model_override(session_key)
+        if override is None:
+            override = self._session_model_override(session_key)
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)

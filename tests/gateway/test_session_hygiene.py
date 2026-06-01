@@ -445,7 +445,10 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert _cd_args[0] == "sess-timeout"
     assert _cd_args[1] > time.time()
     timeout_warnings = [s for s in adapter.sent if "took too long" in s["content"]]
-    assert len(timeout_warnings) == int(warning_notifications)
+    # Behavior witness: the compression-timeout notice is intentionally log-only
+    # regardless of the warning-notifications knob (a slow summary model made it
+    # fire every turn); actionable failure warnings still reach the chat.
+    assert len(timeout_warnings) == 0
     fake_db.archive_and_compact.assert_not_called()
     assert lease_released.is_set()
     # Event/state assertions prove the host returned before the detached

@@ -191,6 +191,14 @@ class GatewayTurnMixin:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
         override = _override_state.conversation.model_override if _override_state else None
+        # Fallback: check session_models.json (written by the kanban app's
+        # model selector) when no in-memory override exists.  The kanban app
+        # persists per-session model choices to this file; the gateway must
+        # honour them on the next turn even if it wasn't running when the
+        # override was written.
+        _file_override: Optional[Dict[str, str]] = None
+        if not override and skey:
+            override = _file_override = self._load_session_models_file_override(skey)
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -231,11 +239,21 @@ class GatewayTurnMixin:
                 runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
                     override["provider"], target_model=override.get("model") or None)
             except Exception as exc:
-                # Layering the override on the default runtime sent its model to the default provider's
-                # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
-                # so; the persisted override is kept, so the next turn retries it.
-                logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
-                unavailable_override, override = override, None
+                if _file_override is not None and override.get("base_url"):
+                    # Self-contained kanban file entry: it names its own endpoint beside the
+                    # model (router-over-LAN, no credentials), so config-side provider lookup is
+                    # neither needed nor possible. Layering is safe here — _apply_session_model_override
+                    # writes the entry's base_url to the runtime, never the default provider's.
+                    logger.debug(
+                        "Kanban file override provider %s not config-resolved (%s); layering entry endpoint %s",
+                        override["provider"], exc, override["base_url"],
+                    )
+                else:
+                    # Layering the override on the default runtime sent its model to the default provider's
+                    # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
+                    # so; the persisted override is kept, so the next turn retries it.
+                    logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
+                    unavailable_override, override = override, None
         if runtime_kwargs is None:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
@@ -268,7 +286,16 @@ class GatewayTurnMixin:
                         model = ch_runtime_model
 
         if override and skey:
-            model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)
+            if _file_override is not None and self._session_model_override(skey) is None:
+                # File-loaded override (kanban selector): seed it as a read-only source so
+                # _apply_session_model_override sees it. NOT stored in memory — the file is the
+                # live source of truth (kanban rewrites it on every selector change) and a cached
+                # copy would shadow later file edits until restart.
+                model, runtime_kwargs = self._apply_session_model_override(
+                    skey, model, runtime_kwargs, override=_file_override,
+                )
+            else:
+                model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)
 
         # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
         # provider's first catalog model.
@@ -996,9 +1023,10 @@ class GatewayTurnMixin:
             "proceeding without compression this turn%s",
             session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
         )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
-        )
+        # Informational turn-hold deferral is deliberately NOT sent to the chat: the
+        # watermark-fenced worker keeps its commit admission and the summary is adopted when it
+        # finishes (nothing is lost), and a slow summary model makes this fire every turn —
+        # log-only, per user request.
         raise
 
     async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source):
@@ -1051,14 +1079,8 @@ class GatewayTurnMixin:
                 "(total wait %.1fs, ceiling %.1fs); continuing without compression",
                 session_entry.session_id, fence.seconds_since_progress(), _hyg_elapsed, hs.total_ceiling_seconds,
             )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta,
-            _hygiene_compression_timeout_message(
-                total_exhausted=_hyg_total_exhausted, elapsed=_hyg_elapsed,
-                idle_timeout=hs.timeout_seconds, progress_observed=fence.progress_observed,
-            ),
-            "compression-timeout warning",
-        )
+        # Same as turn-hold: a timeout means the turn proceeds uncompressed and hygiene records a
+        # cooldown — informational, log-only. Actionable failure warnings still reach the chat.
         raise
 
     def _hmwa_hygiene_on_unwind(self, attempt, hs, session_entry, session_key):

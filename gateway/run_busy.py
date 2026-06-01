@@ -879,10 +879,21 @@ class GatewayBusySessionMixin:
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
 
+        # Notify the platform adapter (e.g. set a reaction emoji) so it can
+        # provide visual feedback and optionally suppress the text ack below.
+        reaction_handled = False
+        try:
+            reaction_handled = bool(await adapter.on_busy_received(event, effective_mode))
+        except Exception:
+            pass
+
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.
-        if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
-            logger.debug("Busy ack suppressed for session %s", session_key)
+        if (
+            os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true"
+            or reaction_handled
+        ):
+            logger.debug("Busy ack suppressed for session %s (reaction=%s)", session_key, reaction_handled)
             return True  # input still processed, just no ack sent
 
         # Debounce (30s) before the config-heavy display lookup.
