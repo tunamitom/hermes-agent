@@ -271,11 +271,13 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     # advances it (the deferral is not a failure).
     assert not fake_db.increment_hygiene_failure_streak.called
     assert fake_db.reset_hygiene_failure_streak.called
-    # Deferral notice still reaches the user.
+    # Behavior witness: the informational turn-hold deferral notice is
+    # intentionally NOT sent to the chat (log-only — a slow summary model made
+    # it fire every turn; nothing is lost since the worker still adopts).
     sent = [m["content"] for m in adapter.sent]
-    assert any(
+    assert not any(
         "deferred" in c.lower() or "still streaming" in c.lower() for c in sent
-    ), f"turn-hold must send deferral notice, got: {sent}"
+    ), f"turn-hold must stay silent in-chat, got: {sent}"
 
 
 @pytest.mark.asyncio
