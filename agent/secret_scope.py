@@ -244,7 +244,16 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = bound.mapping.get(name)
         if val is not None:
             return val
-        return default if serves_routed_profile() else _environ_or(name, default)
+        if serves_routed_profile():
+            # ``network.env`` is machine-wide host topology (shared by every
+            # profile by design), not a per-profile credential, so a served
+            # profile may resolve it. Without this a config.yaml ``${VAR}``
+            # ref stays literal in profile turns only — the launch profile
+            # falls through to ``os.environ`` and looks fine.
+            from hermes_constants import network_env_values
+            shared = network_env_values().get(name)
+            return shared if shared is not None else default
+        return _environ_or(name, default)
     if is_multiplex_active():
         launch_scope = _LAUNCH_BODY_SCOPE.get()
         if launch_scope is not None:
