@@ -99,3 +99,19 @@ def warning_notifications_enabled(platform, user_config=None) -> bool:
         user_config = {}
     platform_key = getattr(platform, "value", platform)
     return not resolve_display_setting(user_config, platform_key, "suppress_warning_notifications", False)
+
+
+def compression_progress_notices_suppressed(platform, user_config=None) -> bool:
+    """``display.suppress_compression_progress_notices``: opt-in log-only mode for the two
+    high-frequency informational compression notices (turn-hold deferral, compression timeout).
+
+    Default ``False`` preserves upstream delivery semantics (these notices reach the chat
+    whenever ``suppress_warning_notifications`` allows); an operator opts in to silence just
+    these two while actionable failure warnings still reach the chat.
+    """
+    if user_config is None:
+        user_config = effective_user_config()
+    elif not isinstance(user_config, dict):
+        user_config = {}
+    platform_key = getattr(platform, "value", platform)
+    return bool(resolve_display_setting(user_config, platform_key, "suppress_compression_progress_notices", False))
