@@ -16,6 +16,7 @@ def _make_adapter(**extra_env):
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
     adapter.config = PlatformConfig(enabled=True, token="fake-token")
+    adapter._pending_busy_reactions = set()
     adapter._bot = AsyncMock()
     adapter._bot.set_message_reaction = AsyncMock()
     return adapter
@@ -112,6 +113,52 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_on_processing_complete_success(monkeypatch):
+    """Successful processing should set thumbs-up reaction."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.delenv("TELEGRAM_REACTION_SUCCESS", raising=False)
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f44d",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_failure(monkeypatch):
+    """Failed processing should set thumbs-down reaction."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.delenv("TELEGRAM_REACTION_FAILURE", raising=False)
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f44e",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_skipped_when_disabled(monkeypatch):
+    """Processing complete should not react when reactions are disabled."""
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._bot.set_message_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_on_processing_complete_cancelled_clears_reaction(monkeypatch):
     """Cancelled processing should clear the in-progress reaction.
 
@@ -144,6 +191,162 @@ async def test_clear_reactions_handles_api_error_gracefully(monkeypatch):
 
     result = await adapter._clear_reactions("123", "456")
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_clear_reactions_returns_false_without_bot(monkeypatch):
+    """_clear_reactions should return False when bot is not available."""
+    adapter = _make_adapter()
+    adapter._bot = None
+
+    result = await adapter._clear_reactions("123", "456")
+    assert result is False
+
+
+# ── on_busy_received ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_busy_received_steer(monkeypatch):
+    """Steer mode should set thinking-face reaction."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_busy_received(event, "steer")
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001F914",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_busy_received_queue(monkeypatch):
+    """Queue mode should set eyes reaction."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_busy_received(event, "queue")
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001F440",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_busy_received_interrupt(monkeypatch):
+    """Interrupt mode should set zap reaction."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_busy_received(event, "interrupt")
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\u26A1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_busy_received_custom_emoji(monkeypatch):
+    """Custom env var should override default emoji."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.setenv("TELEGRAM_REACTION_STEERED", "\U0001f44d")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_busy_received(event, "steer")
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f44d",
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_busy_received_skipped_when_disabled(monkeypatch):
+    """on_busy_received should not react when reactions are disabled."""
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_busy_received(event, "steer")
+
+    adapter._bot.set_message_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_busy_received_unknown_mode_uses_valid_fallback(monkeypatch):
+    """Unknown mode should fall back to a valid Telegram reaction emoji."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_busy_received(event, "unknown_mode")
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001F440",
+    )
+    assert ("123", "456") in adapter._pending_busy_reactions
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_clears_pending_busy_reactions(monkeypatch):
+    """When a run finishes, any busy reactions on follow-up messages should be cleared."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.delenv("TELEGRAM_REACTION_SUCCESS", raising=False)
+    adapter = _make_adapter()
+    adapter._pending_busy_reactions = {("123", "789"), ("123", "790")}
+
+    await adapter.on_processing_complete(_make_event(message_id="456"), ProcessingOutcome.SUCCESS)
+
+    # Original message gets success reaction
+    adapter._bot.set_message_reaction.assert_any_call(
+        chat_id=123,
+        message_id=456,
+        reaction="\U0001f44d",
+    )
+    # Pending busy reactions are cleared (called with reaction=None)
+    clear_calls = [
+        c for c in adapter._bot.set_message_reaction.call_args_list
+        if c.kwargs.get("reaction") is None
+    ]
+    assert len(clear_calls) == 2
+    assert adapter._pending_busy_reactions == set()
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_cancelled_clears_pending_busy_too(monkeypatch):
+    """Cancellation should clear both the main message and any pending busy reactions."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    adapter._pending_busy_reactions = {("123", "789")}
+
+    await adapter.on_processing_complete(_make_event(message_id="456"), ProcessingOutcome.CANCELLED)
+
+    # Main message cleared
+    adapter._bot.set_message_reaction.assert_any_call(
+        chat_id=123,
+        message_id=456,
+        reaction=None,
+    )
+    # Pending busy reaction also cleared
+    adapter._bot.set_message_reaction.assert_any_call(
+        chat_id=123,
+        message_id=789,
+        reaction=None,
+    )
+    assert adapter._pending_busy_reactions == set()
 
 
 # ── config.py bridging ───────────────────────────────────────────────

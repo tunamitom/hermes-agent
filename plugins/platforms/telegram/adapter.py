@@ -618,6 +618,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # has to cover the gap left by a landed message. 0 restores a call per intermediate send.
         self._telegram_typing_retrigger_interval: float = self._coerce_float_extra(
             "typing_retrigger_min_interval_seconds", 2.0, min_value=0.0, max_value=30.0)
+        # Track messages that received a busy reaction (steer/queue/interrupt)
+        # so we can clear them when the current run completes.
+        self._pending_busy_reactions: set[tuple[str, str]] = set()
         # Buffer album/photo bursts into a single MessageEvent instead of self-interrupting turns.
         self._media_batch_delay_seconds = env_float("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", 0.8)
         self._pending_photo_batches: Dict[str, MessageEvent] = {}
@@ -7209,6 +7212,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # -- Message reactions (processing lifecycle) --
 
+    @staticmethod
+    def _reaction_emoji(env_var: str, default: str) -> str:
+        """Return a reaction emoji, falling back to *default*.
+
+        If the env var is set to an empty string the caller should clear
+        (or skip) the reaction instead of applying a default.
+        """
+        val = os.getenv(env_var)
+        return val if val is not None else default
+
     def _reactions_enabled(self) -> bool:
         """Reactions: scoped ``TELEGRAM_REACTIONS`` → ``extra.reactions`` (YAML, per profile) → off.
 
@@ -7246,7 +7259,9 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+            emoji = self._reaction_emoji("TELEGRAM_REACTION_START", "\U0001f440")
+            if emoji:  # empty string = skip reaction entirely
+                await self._set_reaction(chat_id, message_id, emoji)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction (set_message_reaction
@@ -7259,8 +7274,52 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
+        elif outcome == ProcessingOutcome.SUCCESS:
+            emoji = self._reaction_emoji("TELEGRAM_REACTION_SUCCESS", "\U0001f44d")
+            if emoji:  # empty string = clear reactions (ack → no reaction)
+                await self._set_reaction(chat_id, message_id, emoji)
+            else:
+                await self._clear_reactions(chat_id, message_id)
         else:
-            await self._set_reaction(chat_id, message_id, "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e")
+            emoji = self._reaction_emoji("TELEGRAM_REACTION_FAILURE", "\U0001f44e")
+            if emoji:
+                await self._set_reaction(chat_id, message_id, emoji)
+            else:
+                await self._clear_reactions(chat_id, message_id)
+
+        # Clear any pending busy reactions on follow-up messages.
+        for bc, bm in list(self._pending_busy_reactions):
+            await self._clear_reactions(bc, bm)
+        self._pending_busy_reactions.clear()
+
+    async def on_busy_received(self, event: MessageEvent, mode: str) -> bool:
+        """Hook called when a follow-up message arrives while the agent is busy.
+
+        Sets a reaction emoji based on the busy mode and tracks it for cleanup
+        when the current run completes.
+        """
+        if not self._reactions_enabled():
+            return False
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not (chat_id and message_id):
+            return False
+        # Mode-specific emoji: steer → 🤔, queue → 👀, interrupt → ⚡
+        _mode_emojis = {
+            "steer": "\U0001F914",
+            "queue": "\U0001F440",
+            "interrupt": "\u26A1",
+        }
+        default_emoji = _mode_emojis.get(mode, "\U0001F440")  # fallback: 👀
+        env_key = {
+            "steer": "TELEGRAM_REACTION_STEERED",
+            "queue": "TELEGRAM_REACTION_QUEUED",
+            "interrupt": "TELEGRAM_REACTION_INTERRUPTED",
+        }.get(mode)
+        emoji = self._reaction_emoji(env_key, default_emoji) if env_key else default_emoji
+        if await self._set_reaction(chat_id, message_id, emoji):
+            self._pending_busy_reactions.add((str(chat_id), str(message_id)))
+        return True  # suppress default text ack — reaction is the feedback
 
 
 # -- Plugin registration glue: register(ctx) plus the hook implementations (adapter factory, YAML→env/extra
@@ -7382,6 +7441,18 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         ("ignored_threads", "TELEGRAM_IGNORED_THREADS", True)):
         _bridge_gate(key, env, telegram_cfg.get(key), seed_extra=seed)
     _bridge_lower("reactions", "TELEGRAM_REACTIONS")
+    # Customizable reaction emojis (local patch): reaction_* keys bridge to
+    # TELEGRAM_REACTION_* env vars read by _reaction_emoji().
+    for _rkey, _renv in (
+        ("reaction_start", "TELEGRAM_REACTION_START"),
+        ("reaction_success", "TELEGRAM_REACTION_SUCCESS"),
+        ("reaction_failure", "TELEGRAM_REACTION_FAILURE"),
+        ("reaction_steer", "TELEGRAM_REACTION_STEERED"),
+        ("reaction_queue", "TELEGRAM_REACTION_QUEUED"),
+        ("reaction_interrupt", "TELEGRAM_REACTION_INTERRUPTED"),
+    ):
+        if _rkey in telegram_cfg:
+            _set_env(_renv, str(telegram_cfg[_rkey]))
     if "proxy_url" in telegram_cfg:
         # Seeded into extra so ``_build_ptb_requests`` keeps a secondary's route without the env bridge.
         extras.setdefault("proxy_url", str(telegram_cfg["proxy_url"]).strip())

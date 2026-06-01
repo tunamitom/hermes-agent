@@ -3553,6 +3553,15 @@ class BasePlatformAdapter(ABC):
         if emoji:
             await add(chat_id, message_id, emoji)
 
+    async def on_busy_received(self, event: MessageEvent, mode: str) -> bool:
+        """Hook called when a follow-up message arrives while the agent is busy.
+
+        ``mode`` is one of ``"steer"``, ``"queue"``, or ``"interrupt"``.
+        Subclasses can override to add visual feedback (e.g. a ⏩ reaction).
+        Return ``True`` to suppress the default text acknowledgment.
+        """
+        return False
+
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
