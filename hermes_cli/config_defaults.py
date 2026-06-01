@@ -919,6 +919,10 @@ DEFAULT_CONFIG = {
         # Engine warning/failure notifications stay visible unless an operator opts in.
         # Does not suppress task results, manual commands, or existing logs.
         "suppress_warning_notifications": False,
+        # Opt-in log-only mode for the two high-frequency informational compression notices
+        # (turn-hold deferral, compression timeout): a slow summary model makes them fire every
+        # turn. Actionable failure warnings still reach the chat.
+        "suppress_compression_progress_notices": False,
         # Codex Responses commentary channel: true delivers completed commentary as mid-turn interim
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,

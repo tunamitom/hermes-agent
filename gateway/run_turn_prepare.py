@@ -117,6 +117,14 @@ class GatewayTurnPrepareMixin:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
         override = _override_state.conversation.model_override if _override_state else None
+        # Fallback: check session_models.json (written by the kanban app's
+        # model selector) when no in-memory override exists.  The kanban app
+        # persists per-session model choices to this file; the gateway must
+        # honour them on the next turn even if it wasn't running when the
+        # override was written.
+        _file_override: Optional[Dict[str, str]] = None
+        if not override and skey:
+            override = _file_override = self._load_session_models_file_override(skey)
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -157,12 +165,22 @@ class GatewayTurnPrepareMixin:
                 runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
                     override["provider"], target_model=override.get("model") or None)
             except Exception as exc:
-                # Layering the override on the default runtime sent its model to the default provider's
-                # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
-                # so; the persisted override is kept, so the next turn retries it.
-                logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc,
-                               exc_info=True)
-                unavailable_override, override = override, None
+                if _file_override is not None and override.get("base_url"):
+                    # Self-contained kanban file entry: it names its own endpoint beside the
+                    # model (router-over-LAN, no credentials), so config-side provider lookup is
+                    # neither needed nor possible. Layering is safe here — _apply_session_model_override
+                    # writes the entry's base_url to the runtime, never the default provider's.
+                    logger.debug(
+                        "Kanban file override provider %s not config-resolved (%s); layering entry endpoint %s",
+                        override["provider"], exc, override["base_url"],
+                    )
+                else:
+                    # Layering the override on the default runtime sent its model to the default provider's
+                    # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
+                    # so; the persisted override is kept, so the next turn retries it.
+                    logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc,
+                                   exc_info=True)
+                    unavailable_override, override = override, None
         if runtime_kwargs is None:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
@@ -195,7 +213,16 @@ class GatewayTurnPrepareMixin:
                         model = ch_runtime_model
 
         if override and skey:
-            model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)
+            if _file_override is not None and self._session_model_override(skey) is None:
+                # File-loaded override (kanban selector): seed it as a read-only source so
+                # _apply_session_model_override sees it. NOT stored in memory — the file is the
+                # live source of truth (kanban rewrites it on every selector change) and a cached
+                # copy would shadow later file edits until restart.
+                model, runtime_kwargs = self._apply_session_model_override(
+                    skey, model, runtime_kwargs, override=_file_override,
+                )
+            else:
+                model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)
 
         # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
         # provider's first catalog model.

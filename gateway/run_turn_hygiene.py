@@ -413,9 +413,15 @@ class GatewayTurnHygieneMixin:
             "proceeding without compression this turn%s",
             session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
         )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
-        )
+        # Narrowed log-only mode (local patch, opt-in via
+        # display.suppress_compression_progress_notices): a slow summary model makes this fire
+        # every turn. Default keeps upstream delivery (the notice reaches the chat); the
+        # watermark-fenced worker keeps its commit admission either way (nothing is lost).
+        from gateway.warning_notifications import compression_progress_notices_suppressed
+        if not compression_progress_notices_suppressed(getattr(source, "platform", None)):
+            await self._hmwa_hygiene_notify(
+                source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
+            )
         raise
 
     async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source):
@@ -467,14 +473,20 @@ class GatewayTurnHygieneMixin:
                 "(total wait %.1fs, ceiling %.1fs); continuing without compression",
                 session_entry.session_id, fence.seconds_since_progress(), _hyg_elapsed, hs.total_ceiling_seconds,
             )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta,
-            _hygiene_compression_timeout_message(
-                total_exhausted=_hyg_total_exhausted, elapsed=_hyg_elapsed,
-                idle_timeout=hs.timeout_seconds, progress_observed=fence.progress_observed,
-            ),
-            "compression-timeout warning",
-        )
+        # Narrowed log-only mode (local patch, opt-in via
+        # display.suppress_compression_progress_notices): a timeout means the turn proceeds
+        # uncompressed and hygiene records a cooldown — informational. Default keeps upstream
+        # delivery; actionable failure warnings still reach the chat either way.
+        from gateway.warning_notifications import compression_progress_notices_suppressed
+        if not compression_progress_notices_suppressed(getattr(source, "platform", None)):
+            await self._hmwa_hygiene_notify(
+                source, attempt.meta,
+                _hygiene_compression_timeout_message(
+                    total_exhausted=_hyg_total_exhausted, elapsed=_hyg_elapsed,
+                    idle_timeout=hs.timeout_seconds, progress_observed=fence.progress_observed,
+                ),
+                "compression-timeout warning",
+            )
         raise
 
     def _hmwa_hygiene_on_unwind(self, attempt, hs, session_entry, session_key):
