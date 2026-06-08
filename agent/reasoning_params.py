@@ -7,7 +7,7 @@ Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO
 import time
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
-from agent.message_sanitization import matches_reasoning_echo_family
+from agent.message_sanitization import matches_reasoning_echo_family, probe_local_reasoning_families
 from utils import base_url_host_matches
 
 # Static OpenRouter fallback when the live /v1/models capability cache is cold.
@@ -168,7 +168,8 @@ class ReasoningParamsMixin:
         if cached is not None and cached[0] == key:
             return cached[1]
         result = (self._needs_deepseek_tool_reasoning() or self._needs_kimi_tool_reasoning()
-                  or self._needs_mimo_tool_reasoning() or self._reasoning_echo_opt_in())
+                  or self._needs_mimo_tool_reasoning() or self._needs_qwen_tool_reasoning()
+                  or self._reasoning_echo_opt_in())
         self._thinking_pad_cache = (key, result)
         return result
 
@@ -191,7 +192,9 @@ class ReasoningParamsMixin:
     # provider and no model (its rule matches exact provider ids + hosts only).
     def _needs_kimi_tool_reasoning(self) -> bool:
         """True when the current provider is Kimi / Moonshot thinking mode."""
-        return matches_reasoning_echo_family("kimi", self.provider, None, self.base_url)
+        if matches_reasoning_echo_family("kimi", self.provider, None, self.base_url):
+            return True
+        return self._probe_local_for_reasoning_model("kimi")
 
     def _needs_deepseek_tool_reasoning(self) -> bool:
         """True when the current provider is DeepSeek thinking mode (omitting the echo is an HTTP 400).
@@ -199,11 +202,41 @@ class ReasoningParamsMixin:
         DeepSeek V4 thinking mode requires ``reasoning_content`` on every assistant tool-call turn; omitting
         it causes HTTP 400 when the message is replayed in a subsequent API request (#15250).
         """
-        return matches_reasoning_echo_family("deepseek", (self.provider or "").lower(), self.model, self.base_url)
+        if matches_reasoning_echo_family("deepseek", (self.provider or "").lower(), self.model, self.base_url):
+            return True
+        return self._probe_local_for_reasoning_model("deepseek")
 
     def _needs_mimo_tool_reasoning(self) -> bool:
         """True when the current provider is Xiaomi MiMo thinking mode."""
-        return matches_reasoning_echo_family("mimo", (self.provider or "").lower(), self.model, self.base_url)
+        if matches_reasoning_echo_family("mimo", (self.provider or "").lower(), self.model, self.base_url):
+            return True
+        return self._probe_local_for_reasoning_model("mimo")
+
+    def _needs_qwen_tool_reasoning(self) -> bool:
+        """True when the current provider is Qwen thinking mode.
+
+        Qwen 3.x thinking models (e.g. Qwen3-235B, Qwen3.8-27B) require
+        ``reasoning_content`` on every assistant tool-call message when
+        replaying history; omitting it causes garbled output or leaked
+        tool-call syntax.
+
+        Rule table owner: ``agent.message_sanitization.reasoning_echo_family``.
+        """
+        if matches_reasoning_echo_family("qwen", (self.provider or "").lower(), self.model, self.base_url):
+            return True
+        return self._probe_local_for_reasoning_model("qwen")
+
+    # ── Local probe for reasoning model detection ─────────────────────────
+
+    def _probe_local_for_reasoning_model(self, family: str) -> bool:
+        """True when a local endpoint behind ``base_url`` serves a *family* reasoning model.
+
+        Covers alias routes (a router publishing e.g. ``fast`` -> ``mimo-pro``) whose
+        session-level model id defeats the rule table's substrings. Probe + cache live in
+        ``message_sanitization.probe_local_reasoning_families`` so the wire policy and the
+        compaction estimators share one answer.
+        """
+        return probe_local_reasoning_families(getattr(self, "base_url", None)).get(family, False)
 
     _copy_reasoning_content_for_api = _forward("agent.agent_runtime_helpers", "copy_reasoning_content_for_api")
 
