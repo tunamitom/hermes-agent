@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from functools import partial
 from typing import Any, Callable, Iterable, NamedTuple
 
@@ -465,9 +466,9 @@ __all__ = [
     "_strip_images_from_messages", "_strip_non_ascii", "apply_reasoning_content_policy",
     "close_interrupted_tool_sequence", "coalesce_tool_call_id", "coerce_tool_name",
     "deterministic_call_id", "matches_reasoning_echo_family", "needs_reasoning_echo",
-    "normalize_provider_tool_call_ids", "reapply_reasoning_echo", "reasoning_echo_family",
-    "reasoning_replay_route", "record_reasoning_field_rejection", "rejected_reasoning_carriers",
-    "route_reasoning_carriers",
+    "normalize_provider_tool_call_ids", "probe_local_reasoning_families", "reapply_reasoning_echo",
+    "reasoning_echo_family", "reasoning_replay_route", "record_reasoning_field_rejection",
+    "rejected_reasoning_carriers", "route_reasoning_carriers",
     "sanitize_outbound_kwargs", "stale_thinking_reaches_wire", "strip_images_for_rejecting_model",
     "tool_call_id_variants", "tool_result_id_variants", "uniquify_tool_call_ids",
 ]
@@ -748,6 +749,76 @@ def reasoning_replay_route(
     # A strict route never gets a reasoning key, not even the must-echo pad.
     return ReasoningReplayRoute(pad and RC in carriers, carriers)
 
+# ── Unified local probe for reasoning-family detection ───────────────────────
+# Alias routers (publishing e.g. ``fast`` -> ``mimo-pro``) leave the session with a
+# model id the rule table's substrings can't match, so local endpoints are probed.
+# Confirmed results (a family hit or any parsed response) cache for the process; an
+# unconfirmed all-False (network failure) caches only for _REASONING_PROBE_RETRY_S —
+# a router hiccup must not pin detection off for the process lifetime: that silently
+# drops the echo and MiMo thinking replays 400.
+_REASONING_PROBE_FAMILIES = ("mimo", "kimi", "deepseek", "qwen")
+_REASONING_PROBE_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "192.168.", ".ts.net")
+_REASONING_PROBE_RETRY_S = 60.0
+# base_url -> (retry_after monotonic ts, or None when confirmed, family -> bool)
+_reasoning_probe_cache: dict = {}
+
+
+def probe_local_reasoning_families(base_url: Any, *, _urlopen: Callable | None = None) -> dict:
+    """One-shot probe of local sglang/vLLM/OpenAI-compatible backends behind *base_url*.
+
+    Strategy 1: sglang ``/get_model_info`` → ``model_type`` substring. Strategy 2:
+    ``/v1/models`` → model id and alias ``root`` substring (covers alias routers whose
+    per-session id is e.g. ``fast``). Returns family → bool; empty dict for non-local
+    endpoints. Best-effort: never raises.
+    """
+    base_url = (base_url or "").strip()
+    if not base_url or not any(h in base_url for h in _REASONING_PROBE_HOSTS):
+        return {}
+    entry = _reasoning_probe_cache.get(base_url)
+    now = time.monotonic()
+    if entry is not None:
+        retry_after, cached = entry
+        if retry_after is None or now < retry_after:
+            return dict(cached)
+    import urllib.request as _req
+    urlopen = _urlopen or _req.urlopen
+    detected: dict = {f: False for f in _REASONING_PROBE_FAMILIES}
+    confirmed = False
+    stripped = base_url.rstrip("/")
+    # Strategy 1: sglang /get_model_info → model_type field
+    try:
+        req = _req.Request(stripped.rsplit("/v1", 1)[0] + "/get_model_info", method="GET")
+        with urlopen(req, timeout=3) as resp:
+            info = json.loads(resp.read().decode())
+        model_type = (info.get("model_type") or "").lower()
+        for f in _REASONING_PROBE_FAMILIES:
+            if f in model_type:
+                detected[f] = True
+        confirmed = True
+    except Exception:
+        pass
+    # Strategy 2: standard /v1/models → model id / alias-root substring
+    if not any(detected.values()):
+        try:
+            req = _req.Request(stripped + "/models", method="GET")
+            with urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+            for m in data.get("data") or []:
+                if not isinstance(m, dict):
+                    continue
+                names = ((m.get("id") or ""), (m.get("root") or ""))
+                for f in _REASONING_PROBE_FAMILIES:
+                    if any(f in n.lower() for n in names):
+                        detected[f] = True
+            confirmed = True
+        except Exception:
+            pass
+    if confirmed or any(detected.values()):
+        _reasoning_probe_cache[base_url] = (None, detected)
+    else:
+        _reasoning_probe_cache[base_url] = (now + _REASONING_PROBE_RETRY_S, detected)
+    return dict(detected)
+
 
 def stale_thinking_reaches_wire(api_mode: Any, provider: Any, model: Any, base_url: Any) -> bool:
     """True when stale assistant reasoning text is actually replayed on the wire for the route.
@@ -764,11 +835,16 @@ def stale_thinking_reaches_wire(api_mode: Any, provider: Any, model: Any, base_u
             return True
     if not api_mode:
         # No route facts (a bare compressor): only the must-echo tier is known to replay.
-        return needs_reasoning_echo(provider, model, base_url)
+        return (needs_reasoning_echo(provider, model, base_url)
+                or any(probe_local_reasoning_families(base_url).values()))
     route = reasoning_replay_route(api_mode, provider, model, base_url)
     if route.carriers is None:
-        return (api_mode or "") != "codex_responses" and route.pad
-    return bool(route.carriers & {RC, R})
+        return (api_mode or "") != "codex_responses" and (
+            route.pad or any(probe_local_reasoning_families(base_url).values()))
+    # Alias routes defeat the table's model substrings; fall back to the same local
+    # probe the pad path uses so this predicate and ``_needs_thinking_reasoning_pad()``
+    # give the same answer for the route.
+    return bool(route.carriers & {RC, R}) or any(probe_local_reasoning_families(base_url).values())
 
 
 def native_anthropic_accounting_projection(messages: Any) -> tuple[Any, tuple[str, ...]]:
