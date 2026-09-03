@@ -4313,6 +4313,16 @@ def _try_configured_fallback_chain(
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
+        if task == "vision" and fb_model_raw and entry.get("base_url"):
+            from agent.image_routing import _lookup_endpoint_supports_vision
+
+            supports_vision = _lookup_endpoint_supports_vision(
+                str(entry.get("base_url") or "").strip(), fb_model_raw,
+                api_key=_fallback_entry_api_key(entry) or "",
+            )
+            if supports_vision is False:
+                tried.append(f"fallback_chain[{i}]({fb_provider}) (no published vision support)")
+                continue
         if skip(fb_provider, fb_model_raw, fb_base_url):
             continue
         if _is_provider_unhealthy(fb_provider, fb_base_url):
@@ -5542,7 +5552,36 @@ def _vision_auto_route(
     runtime: dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
     async_mode: bool,
 ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Auto-detect order: 1. main provider + model, 2. OpenRouter, 3. Nous Portal, 4. DeepInfra, 5. stop."""
+    """Auto-detect configured endpoint-published vision routes, then the legacy provider chain."""
+    # An OpenAI-compatible router can publish per-alias vision truth. Prefer the
+    # first configured chain entry that explicitly advertises support; unknown
+    # and false entries both fall through to the existing auto-discovery chain.
+    chain = _get_auxiliary_task_config("vision").get("fallback_chain")
+    if isinstance(chain, list):
+        from agent.image_routing import _lookup_endpoint_supports_vision
+
+        for entry in chain:
+            if not isinstance(entry, dict):
+                continue
+            provider = str(entry.get("provider") or "").strip()
+            model = str(entry.get("model") or "").strip()
+            base_url = str(entry.get("base_url") or "").strip()
+            if not provider or not model or not base_url:
+                continue
+            supports_vision = _lookup_endpoint_supports_vision(
+                base_url, model, api_key=_fallback_entry_api_key(entry) or ""
+            )
+            if supports_vision is not True:
+                continue
+            try:
+                client, default_model = _resolve_fallback_entry(entry)
+            except Exception:
+                continue
+            if client is not None:
+                return _finalize_vision_client(
+                    provider, client, default_model, resolved_model, async_mode
+                )
+
     main_provider = str(runtime.get("provider") or _read_main_provider())
     main_model = str(runtime.get("model") or _read_main_model())
     if main_provider.strip().lower() == "moa":

@@ -1,12 +1,40 @@
 """Routing helpers for inbound user-attached images.
 
-``native`` attaches images as OpenAI-style ``image_url`` parts; ``text`` runs
-``vision_analyze`` up-front and prepends the lossy description (right for
-non-vision models). :func:`decide_image_input_mode` picks once per turn from
-``agent.image_input_mode`` (``auto`` | ``native`` | ``text``): in ``auto`` an
-explicit ``auxiliary.vision`` backend forces ``text`` even for vision-capable
-main models (``native`` is the absolute override); else ``supports_vision``
-(config override or catalog) decides. ``vision_analyze`` stays a tool regardless.
+Two modes:
+
+  native  — attach images as OpenAI-style ``image_url`` content parts on the
+            user turn. Provider adapters (Anthropic, Gemini, Bedrock, Codex,
+            OpenAI chat.completions) already translate these into their
+            vendor-specific multimodal formats.
+
+  text    — run ``vision_analyze`` on each image up-front and prepend the
+            description to the user's text. The model never sees the pixels;
+            it only sees a lossy text summary. This is the pre-existing
+            behaviour and still the right choice for non-vision models.
+
+The decision is made once per message turn by :func:`decide_image_input_mode`.
+It reads ``agent.image_input_mode`` from config.yaml (``auto`` | ``native``
+| ``text``, default ``auto``) and the active model's capability metadata.
+
+In ``auto`` mode (local-patches, narrowed):
+  - Endpoint-PUBLISHED capability (``supports_vision`` on the endpoint's own
+    /v1/models listing — the turin model-router derives it from a live probe
+    per alias) decides: ``True`` → native pixels, ``False`` → text routing.
+    This is the alias-model-swap fix: the endpoint's own listing is the only
+    source that stays correct when the backend behind an alias changes.
+  - Every other verdict source keeps upstream ordering: an explicitly
+    configured ``auxiliary.vision`` backend is the de-facto text route even
+    when the main model has native vision (upstream pin, 2026-08-28 maintainer
+    decision); otherwise ``supports_vision`` (config override or catalog)
+    decides, and unknown capability defaults to text.
+  ``agent.image_input_mode: native`` remains the absolute override for
+    users who want native attach despite a configured aux backend.
+
+This keeps ``vision_analyze`` surfaced as a tool in every session — skills
+and agent flows that chain it (browser screenshots, deeper inspection of
+URL-referenced images, style-gating loops) keep working. The routing only
+affects *how user-attached images on the current turn* are presented to the
+main model.
 """
 
 from __future__ import annotations
@@ -327,6 +355,107 @@ _VISION_PROBES: tuple[tuple[str, Callable[..., Optional[bool]]], ...] = (
 )
 
 
+# ── Endpoint-published vision capability (local-patches) ─────────────────────
+# OpenAI-compatible endpoints (our turin model-router proxy, but any
+# OpenAI-compat server that extends /v1/models) can publish
+# ``supports_vision`` on each model entry. The router derives it from a live
+# probe of the actual backend behind each alias, so it stays correct across
+# model swaps where every static source (config flags, models.dev) goes
+# stale. Short TTL: this fires on image-bearing turns only, and the router
+# caches its own probe for ~5 min, so the cost is one GET per TTL per
+# endpoint while an image is actually being routed.
+_ENDPOINT_VISION_TTL = 300.0
+_endpoint_vision_cache: dict[tuple[str, str], tuple[Optional[bool], float]] = {}
+_endpoint_vision_models: dict[str, tuple[Optional[dict[str, Any]], float]] = {}
+# Set by _lookup_supports_vision on every call (reset BEFORE the lookup in
+# decide_image_input_mode so mocked lookups read False): True iff that call's
+# verdict came from the endpoint-published ``supports_vision`` field.
+_last_lookup_endpoint_published: bool = False
+
+
+_TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
+_FALSE_TOKENS = frozenset({"false", "0", "no", "off"})
+
+
+def _coerce_published_vision(raw: Any) -> Optional[bool]:
+    """Strict bool coercion for the endpoint-published field."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in _TRUE_TOKENS:
+            return True
+        if s in _FALSE_TOKENS:
+            return False
+    return None
+
+
+def _fetch_endpoint_models(base_url: str, api_key: str = "") -> Optional[dict[str, Any]]:
+    """GET {base_url}/v1/models, cached per base_url. None on failure."""
+    import time as _time
+
+    now = _time.monotonic()
+    cached = _endpoint_vision_models.get(base_url)
+    if cached and cached[1] > now:
+        return cached[0]
+    result: Optional[dict[str, Any]] = None
+    try:
+        import httpx
+
+        url = base_url.rstrip("/")
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        with httpx.Client(timeout=5.0, headers=headers) as client:
+            resp = client.get(f"{url}/models")
+            if resp.status_code == 200:
+                result = resp.json()
+    except Exception as exc:  # pragma: no cover - network defensive
+        logger.debug(
+            "image_routing: /v1/models fetch failed for %s — %s", base_url, exc
+        )
+    _endpoint_vision_models[base_url] = (result, now + _ENDPOINT_VISION_TTL)
+    return result
+
+
+def _lookup_endpoint_supports_vision(
+    base_url: str, model: str, api_key: str = ""
+) -> Optional[bool]:
+    """Read ``supports_vision`` for ``model`` from the endpoint's /v1/models.
+
+    Returns True/False when the endpoint publishes the field for the model,
+    None when the field is absent, the model isn't listed, or the endpoint
+    is unreachable (caller falls through to the remaining probes).
+    """
+    if not base_url or not model:
+        return None
+    cache_key = (base_url.rstrip("/"), model)
+    import time as _time
+
+    now = _time.monotonic()
+    cached = _endpoint_vision_cache.get(cache_key)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    result: Optional[bool] = None
+    data = _fetch_endpoint_models(base_url, api_key=api_key)
+    if isinstance(data, dict):
+        entries = data.get("data")
+        if isinstance(entries, list):
+            model_lower = str(model).strip().lower()
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_id = str(entry.get("id") or "").strip().lower()
+                if entry_id != model_lower:
+                    continue
+                if "supports_vision" in entry:
+                    result = _coerce_published_vision(entry.get("supports_vision"))
+                break
+    _endpoint_vision_cache[cache_key] = (result, now + _ENDPOINT_VISION_TTL)
+    return result
+
+
 def _lookup_supports_vision(
     provider: str,
     model: str,
@@ -336,14 +465,21 @@ def _lookup_supports_vision(
 ) -> Optional[bool]:
     """Return True/False if vision capability can be resolved, None if unknown.
 
-    Order: config ``supports_vision`` override → :data:`_VISION_PROBES`
+    Order: config ``supports_vision`` override → the endpoint-published
+    ``supports_vision`` field (local-patches) → :data:`_VISION_PROBES`
     (managed local runtime → models.dev catalog → Ollama probe). A plugin's
     per-model ``ProviderProfile.model_capabilities`` reaches this through the
     catalog probe. The provider-wide ``ProviderProfile.supports_vision`` flag is
     deliberately NOT consulted: it declares that tool-result messages may carry
     images (``tools.vision_tools``), not that every model on the provider can see
     user attachments — relays such as ``router`` set it for mixed catalogs.
+
+    Every call also records (in ``_last_lookup_endpoint_published``) whether the
+    returned verdict came from the endpoint-published field — the provenance
+    decide_image_input_mode scopes its capability-first ordering to.
     """
+    global _last_lookup_endpoint_published
+    _last_lookup_endpoint_published = False
     # Named custom providers are canonicalized to ``provider="custom"``; the
     # original name lives in the context-local main runtime. Borrow it only on an
     # exact provider+model match so background/auxiliary lookups never take
@@ -361,6 +497,28 @@ def _lookup_supports_vision(
     if not provider or not model:
         return None
 
+    base_url = _resolve_inference_base_url(cfg, provider)
+    if not base_url and (provider or "").strip().lower() == "ollama":
+        base_url = "http://localhost:11434/v1"
+
+    # Local-patches extension: OpenAI-compatible endpoints may publish a
+    # ``supports_vision`` capability field on their ``/v1/models`` entries
+    # (our model-router proxy on turin derives it from a live 1x1-png probe
+    # per alias, so model swaps behind aliases are picked up within one
+    # TTL). Custom endpoints always miss models.dev, and static config
+    # flags go stale the moment the backend model changes — the endpoint's
+    # own listing is the freshest per-model truth available. Cached ~5 min
+    # per (base_url, model) so image-bearing turns don't re-fetch every
+    # time; unknown/missing field falls through untouched.
+    if base_url:
+        endpoint_vision = _lookup_endpoint_supports_vision(
+            base_url, model, api_key=_resolve_inference_api_key(cfg, provider)
+        )
+        if endpoint_vision is not None:
+            _last_lookup_endpoint_published = True
+            return endpoint_vision
+
+    # Capability probes after the config override, in priority order.
     for label, probe in _VISION_PROBES:
         try:
             verdict = probe(provider, model, cfg)
@@ -384,11 +542,37 @@ def decide_image_input_mode(
     mode_cfg = _coerce_mode(_dict_or_empty(_dict_or_empty(cfg).get("agent")).get("image_input_mode"))
     if mode_cfg != "auto":
         return mode_cfg
-    if _explicit_aux_vision_override(cfg):  # auto: an explicit auxiliary.vision backend wins
+
+    global _last_lookup_endpoint_published
+
+    # auto ordering (local-patches, NARROWED per upstream pin
+    # ``test_auto_explicit_aux_backend_is_the_de_facto_route`` — upstream tests are
+    # the contract): capability-first applies ONLY when the capability verdict is
+    # ENDPOINT-PUBLISHED (``supports_vision`` on the endpoint's own /v1/models —
+    # the alias-router model-swap fix: the router derives it from a live probe per
+    # alias, the freshest truth when the backend behind an alias changes). Every
+    # other verdict source keeps upstream ordering: an explicit auxiliary.vision
+    # backend is the de-facto route even over a KNOWN vision-capable main model.
+    # ``agent.image_input_mode: native`` remains the absolute override.
+    _last_lookup_endpoint_published = False  # mocked lookups must read as static-source
+    if requested_provider:
+        supports = _lookup_supports_vision(
+            provider,
+            model,
+            cfg,
+            requested_provider=requested_provider,
+        )
+    else:
+        # Keep the long-standing three-argument call contract for callers and
+        # tests that replace the capability lookup hook.
+        supports = _lookup_supports_vision(provider, model, cfg)
+    if _last_lookup_endpoint_published:
+        # Endpoint-published capability decides: True → native pixels, False/unknown
+        # → text (native-on-unknown would 400 on text-only custom endpoints).
+        return "native" if supports is True else "text"
+    if _explicit_aux_vision_override(cfg):
         return "text"
-    # Keep the three-argument call contract for callers/tests that replace the lookup hook.
-    extra = {"requested_provider": requested_provider} if requested_provider else {}
-    return "native" if _lookup_supports_vision(provider, model, cfg, **extra) is True else "text"
+    return "native" if supports is True else "text"
 
 
 # Image size handling is REACTIVE: attach at full size and let
