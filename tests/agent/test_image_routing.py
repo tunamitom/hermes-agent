@@ -58,13 +58,32 @@ class TestDecideImageInputMode:
             assert decide_image_input_mode("openrouter", "brand-new-slug", {}) == "text"
 
     def test_auto_explicit_aux_backend_is_the_defacto_route(self):
-        """Maintainer decision (2026-08-28, reverses #29135): a user who
-        NAMED a dedicated vision backend wants it used — even when the
-        main model has native vision. Config that only takes effect when
-        the main model gets worse is a trap, not a setting."""
+        """Local-patches capability-first ordering (2026-09-03): a KNOWN
+        vision-capable main model attaches natively even when an aux
+        backend is configured. The aux backend is the de-facto route only
+        when capability is UNKNOWN — see the next test. (Replaces the
+        2026-08-28 maintainer decision: a pin that overrides a known-good
+        main model breaks live model swaps on aliased custom endpoints,
+        where the pin silently resolves to a text-only model.)"""
         cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}}}
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "native"
+
+    def test_auto_unknown_capability_aux_backend_is_the_defacto_route(self):
+        """Capability UNKNOWN + explicit aux backend → text via the named
+        backend (upstream intent preserved: the user named a dedicated
+        vision model, so use it when we can't prove the main model can)."""
+        cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=None):
             assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "text"
+
+    def test_auto_known_text_only_routes_text_even_with_native_default(self):
+        """KNOWN text-only main model → text, regardless of aux config —
+        this is the model-swap case the endpoint-published capability
+        field exists to fix."""
+        cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=False):
+            assert decide_image_input_mode("custom", "smart", cfg) == "text"
 
     def test_auto_unset_aux_backend_native_remains_default(self):
         """No configured aux backend -> native for vision-capable mains
