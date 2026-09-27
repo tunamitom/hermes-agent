@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, NamedTuple
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER, hidden_interrupt_placeholder_row
 from agent.message_metadata import DB_ROW_SNAPSHOT
 from agent.vision_message_prep import _provider_model_key
+from agent.reasoning_hygiene import sanitize_reasoning_text
 
 logger = logging.getLogger(__name__)
 
@@ -908,21 +909,24 @@ def _replayable_reasoning_text(msg: dict) -> str | None:
     return None
 
 
-def _apply_legacy_must_echo_pad(source_msg: dict, api_msg: dict) -> None:
+def _apply_legacy_must_echo_pad(source_msg: dict, api_msg: dict, *, sanitize_mimo: bool = False) -> None:
     """Native-adapter wires (``carriers=None``): the pre-replay contract, byte-for-byte. An explicit
     value is kept verbatim (legacy "" upgraded to " "); a tool-call turn holding only another
-    provider's ``reasoning`` is padded instead of converted into a native thinking block."""
+    provider's ``reasoning`` is padded instead of converted into a native thinking block.
+    ``sanitize_mimo`` opts a MiMo session's wire copy into the degenerate-tail trim (the stored
+    session message is untouched)."""
     existing, reasoning = source_msg.get(RC), source_msg.get(R)
     if isinstance(existing, str):
-        api_msg[RC] = existing or " "
+        api_msg[RC] = (sanitize_reasoning_text(existing) if sanitize_mimo else existing) or " "
     elif isinstance(reasoning, str) and reasoning and not source_msg.get("tool_calls"):
-        api_msg[RC] = reasoning
+        api_msg[RC] = sanitize_reasoning_text(reasoning) if sanitize_mimo else reasoning
     else:
         api_msg[RC] = " "
 
 
 def apply_reasoning_content_policy(
     source_msg: dict, api_msg: dict, needs_thinking_pad: bool, carriers: frozenset | None = None,
+    *, sanitize_mimo: bool = False,
 ) -> None:
     """Shape an assistant replay message's reasoning keys for the active route (mutates ``api_msg``).
 
@@ -930,13 +934,19 @@ def apply_reasoning_content_policy(
     (``reasoning_replay_route``). ``carriers=None`` is a non-chat-completions wire: only the
     must-echo ``reasoning_content`` rides there and ``reasoning_details`` is left to the adapter.
     Keys the route does not read are removed, so a strict host never sees one (#45655, #70233).
+
+    ``sanitize_mimo`` trims a degenerate reasoning tail (exact-cycle attractor loop) on the
+    wire copy before replay — MiMo sessions only; other families replay verbatim. The stored
+    session message is untouched and the same stored text always trims identically.
     """
     if source_msg.get("role") != "assistant":
         return
     text = _replayable_reasoning_text(source_msg)
+    if sanitize_mimo and text is not None:
+        text = sanitize_reasoning_text(text)
     effective = carriers if carriers is not None else (frozenset({RC}) if needs_thinking_pad else frozenset())
     if carriers is None and needs_thinking_pad:
-        _apply_legacy_must_echo_pad(source_msg, api_msg)
+        _apply_legacy_must_echo_pad(source_msg, api_msg, sanitize_mimo=sanitize_mimo)
     elif RC in effective and (text is not None or needs_thinking_pad):
         # Must-echo tier: every assistant turn carries the field; " " (not "") when there is no
         # text, because DeepSeek V4 rejects empty string (#17341) and a legacy "" pad upgrades.
@@ -962,13 +972,16 @@ def _reasoning_shape(msg: dict) -> tuple:
     return tuple(msg.get(key) for key in REASONING_CARRIERS)
 
 
-def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool, carriers: frozenset | None = None) -> int:
+def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool, carriers: frozenset | None = None,
+                           *, sanitize_mimo: bool = False) -> int:
     """Reconcile already-built assistant turns with the ACTIVE route.
 
     ``api_messages`` is built once under the primary; a mid-conversation fallback or a recorded
     field rejection changes the route, so baked-in keys are reconciled both ways: TO a must-echo
     provider the pad is re-applied (else 400), TO a strict one the keys are stripped (else 422),
     and a carrier the new route reads is restored from the text that is still present.
+    ``sanitize_mimo`` trims a degenerate reasoning tail on the wire copy before replay (MiMo
+    sessions only; other families replay verbatim).
     Idempotent. Returns the number of assistant turns changed.
     """
     changed = 0
@@ -977,8 +990,19 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool, carrier
             continue
         before = _reasoning_shape(api_msg)
         if carriers is None and needs_thinking_pad and api_msg.get(RC):
+            if sanitize_mimo:
+                # Already-built turns carry the poison in reasoning_content itself;
+                # sanitize the present value too (pads and healthy text pass through
+                # byte-identical; only a degenerate tail is trimmed).
+                cur = api_msg[RC]
+                if isinstance(cur, str):
+                    trimmed = sanitize_reasoning_text(cur)
+                    if trimmed != cur:
+                        api_msg[RC] = trimmed
+                        changed += 1
             continue
-        apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad, carriers)
+        apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad, carriers,
+                                       sanitize_mimo=sanitize_mimo)
         changed += _reasoning_shape(api_msg) != before
     return changed
 

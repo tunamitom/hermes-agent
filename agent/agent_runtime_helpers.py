@@ -3494,10 +3494,18 @@ def intent_ack_continuation_mode(agent) -> str:
     return "codex_only" if agent.api_mode == "codex_responses" else "off"
 
 
+def _sanitize_mimo_for(agent) -> bool:
+    """``sanitize_mimo`` for a session agent: True only for a live MiMo session (the probe
+    predicate on a real agent). Stub/test agents without the predicate replay verbatim."""
+    fn = getattr(agent, "_needs_mimo_tool_reasoning", None)
+    return bool(fn()) if fn else False
+
+
 def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:
     """Forward reasoning fields onto an API replay message; policy lives in ``agent.message_sanitization.apply_reasoning_content_policy``."""
     from agent.message_sanitization import apply_reasoning_content_policy
-    apply_reasoning_content_policy(source_msg, api_msg, *agent._reasoning_replay_route())
+    apply_reasoning_content_policy(source_msg, api_msg, *agent._reasoning_replay_route(),
+                                   sanitize_mimo=_sanitize_mimo_for(agent))
 
 
 def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
@@ -3513,7 +3521,8 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     request falls back to Mistral, and Mistral 422s on the stale pad.
     """
     from agent.message_sanitization import reapply_reasoning_echo
-    return reapply_reasoning_echo(api_messages, *agent._reasoning_replay_route())
+    return reapply_reasoning_echo(api_messages, *agent._reasoning_replay_route(),
+                                  sanitize_mimo=_sanitize_mimo_for(agent))
 
 
 def _iter_httpx_pools_with_owner(http_client: Any):
