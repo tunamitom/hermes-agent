@@ -3403,7 +3403,8 @@ def intent_ack_continuation_mode(agent) -> str:
 def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:
     """Forward reasoning fields onto an API replay message; policy lives in ``agent.message_sanitization.apply_reasoning_content_policy``."""
     from agent.message_sanitization import apply_reasoning_content_policy
-    apply_reasoning_content_policy(source_msg, api_msg, agent._needs_thinking_reasoning_pad())
+    apply_reasoning_content_policy(source_msg, api_msg, agent._needs_thinking_reasoning_pad(),
+                                   sanitize_mimo=agent._needs_mimo_tool_reasoning())
 
 
 def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
@@ -3419,7 +3420,8 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     request falls back to Mistral, and Mistral 422s on the stale pad.
     """
     from agent.message_sanitization import reapply_reasoning_echo
-    return reapply_reasoning_echo(api_messages, agent._needs_thinking_reasoning_pad())
+    return reapply_reasoning_echo(api_messages, agent._needs_thinking_reasoning_pad(),
+                                  sanitize_mimo=agent._needs_mimo_tool_reasoning())
 
 
 def _iter_httpx_pools_with_owner(http_client: Any):

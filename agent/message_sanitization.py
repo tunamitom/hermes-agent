@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from agent.message_metadata import DB_ROW_SNAPSHOT
 from agent.vision_message_prep import _provider_model_key
+from agent.reasoning_hygiene import sanitize_reasoning_text
 
 logger = logging.getLogger(__name__)
 
@@ -814,9 +815,15 @@ def native_anthropic_accounting_projection(messages: Any) -> tuple[Any, tuple[st
     return projected, tuple(replayed_thinking)
 
 
-def apply_reasoning_content_policy(source_msg: dict, api_msg: dict, needs_thinking_pad: bool) -> None:
+def apply_reasoning_content_policy(source_msg: dict, api_msg: dict, needs_thinking_pad: bool,
+                                   *, sanitize_mimo: bool = False) -> None:
     """Copy provider-facing reasoning fields onto an API replay message (mutates ``api_msg``).
-    ``needs_thinking_pad`` is the require-side flag (``needs_reasoning_echo``)."""
+    ``needs_thinking_pad`` is the require-side flag (``needs_reasoning_echo``).
+    ``sanitize_mimo`` trims a degenerate reasoning tail (exact-cycle attractor loop)
+    before it reaches the wire — MiMo sessions only; other families replay verbatim.
+    Only the wire copy is trimmed: the stored session message is untouched, and the
+    same stored text always trims identically, so the replay prefix stays stable
+    after the single re-prefill that follows a poisoned turn."""
     if source_msg.get("role") != "assistant":
         return
     if not needs_thinking_pad:
@@ -837,9 +844,16 @@ def apply_reasoning_content_policy(source_msg: dict, api_msg: dict, needs_thinki
     #   ``reapply_reasoning_echo`` covers the already-built api_messages path. Refs #45655.
     if isinstance(existing, str):
         # Explicit value: preserve verbatim, upgrading legacy "" to " " (DeepSeek V4 400s on "").
+        # Hermes stores streamed reasoning in THIS field (reasoning_content); the
+        # degenerate-tail trim must cover it, not just the 'reasoning' fallback —
+        # pads (" ", "") sanitize to themselves and healthy text is byte-identical.
+        if sanitize_mimo:
+            existing = sanitize_reasoning_text(existing)
         api_msg["reasoning_content"] = existing or " "
     elif isinstance(reasoning, str) and reasoning and not source_msg.get("tool_calls"):
         # Healthy session: promote internal 'reasoning' → 'reasoning_content'.
+        if sanitize_mimo:
+            reasoning = sanitize_reasoning_text(reasoning)
         api_msg["reasoning_content"] = reasoning
     else:
         # tool_calls + 'reasoning' but no 'reasoning_content' means the reasoning came from
@@ -849,7 +863,8 @@ def apply_reasoning_content_policy(source_msg: dict, api_msg: dict, needs_thinki
         api_msg["reasoning_content"] = " "
 
 
-def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
+def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool,
+                           *, sanitize_mimo: bool = False) -> int:
     """Re-pad (or strip) assistant turns' reasoning_content for the ACTIVE provider.
 
     ``api_messages`` is built once under the primary provider; a mid-conversation fallback
@@ -873,8 +888,19 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
         #   #17341.
         if needs_thinking_pad:
             if not api_msg.get("reasoning_content"):
-                apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad)
+                apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad,
+                                               sanitize_mimo=sanitize_mimo)
                 changed += 1 if api_msg.get("reasoning_content") else 0
+            elif sanitize_mimo:
+                # Already-built messages carry the poison in reasoning_content itself;
+                # sanitize the present value too (pads and healthy text pass through
+                # byte-identical; only a degenerate tail is trimmed).
+                cur = api_msg["reasoning_content"]
+                if isinstance(cur, str):
+                    trimmed = sanitize_reasoning_text(cur)
+                    if trimmed != cur:
+                        api_msg["reasoning_content"] = trimmed
+                        changed += 1
         elif "reasoning_content" in api_msg:
             api_msg.pop("reasoning_content", None)
             changed += 1

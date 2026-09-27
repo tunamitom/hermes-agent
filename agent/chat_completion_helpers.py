@@ -1299,11 +1299,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
-    _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
-    from agent.chat_completion_nonstream import _NonStreamRequest
+        response = direct_api_call(agent, api_kwargs)
+    else:
+        _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
+        from agent.chat_completion_nonstream import _NonStreamRequest
 
-    return _NonStreamRequest(agent, api_kwargs).run()
+        response = _NonStreamRequest(agent, api_kwargs).run()
+    # Post-hoc degenerate-reasoning check for completed responses:
+    # non-streaming cannot abort mid-generation, so the poison is dropped here
+    # before persistence/replay. MiMo echo routes only; a no-op elsewhere.
+    _sanitize_completed_response_reasoning(agent, response)
+    return response
 
 
 def _consume_ephemeral_reasoning_off(agent) -> bool:
@@ -2576,6 +2582,84 @@ def _stream_final_text(response) -> str:
     return ""
 
 
+# User-visible notice for a reasoning-loop abort. Same voice as
+# agent.repetition_guard.REPETITION_LOOP_INTERRUPTED (the content-loop
+# sibling): the model only needs to know the reasoning degenerated and the
+# turn was cut off — the loop text itself is never replayed or shown.
+REASONING_LOOP_ABORT_NOTICE = "[the reasoning degenerated into a repetition loop and was interrupted]"
+
+
+def _reasoning_loop_abort_response(role, model_name, usage_obj):
+    """Terminal response for a live reasoning-loop abort (reviews #6/#7).
+
+    One explicit detector-aborted outcome inside the stream event boundary:
+    the notice is the answer, so there is no success event followed by an
+    interruption, no retryable error, no tool calls to execute, and no
+    reasoning to persist (the caller cleared the accumulators at abort).
+    """
+    message = SimpleNamespace(role=role, content=REASONING_LOOP_ABORT_NOTICE, tool_calls=None,
+                              reasoning_content=None, refusal=None)
+    return SimpleNamespace(id="reasoning-loop-abort", model=model_name, usage=usage_obj,
+                           provider=None, choices=[SimpleNamespace(
+                               index=0, message=message, finish_reason="stop")])
+
+
+def _sanitize_completed_response_reasoning(agent, response) -> bool:
+    """Post-hoc degenerate-reasoning check for COMPLETED responses.
+
+    A non-streaming client cannot abort generation mid-flight, so completed
+    responses are checked here instead: degenerate reasoning — from
+    reasoning_content, the 'reasoning' fallback, or readable reasoning_details
+    entries (same extraction as the streaming display; opaque signature
+    entries are never judged) — is dropped before it can be persisted or
+    replayed, and a response with no visible content surfaces the loop notice
+    instead of an empty answer. This prevents persistence/replay, not token
+    burn; live containment is the streaming guard. MiMo echo routes only; a
+    no-op for every other model. Returns True when altered.
+    """
+    try:
+        if response is None or not agent._needs_mimo_tool_reasoning():
+            return False
+        choices = getattr(response, "choices", None)
+        first = choices[0] if isinstance(choices, (list, tuple)) and choices else None
+        message = getattr(first, "message", None)
+        if message is None:
+            return False
+        reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+        if reasoning is None and isinstance(getattr(message, "model_extra", None), dict):
+            extra = message.model_extra
+            reasoning = extra.get("reasoning_content") or extra.get("reasoning")
+        details = getattr(message, "reasoning_details", None)
+        if details is None and isinstance(getattr(message, "model_extra", None), dict):
+            details = message.model_extra.get("reasoning_details")
+        if (not isinstance(reasoning, str) or not reasoning) and isinstance(details, (list, tuple)):
+            # Details-only response: judge the readable detail text.
+            reasoning = "".join(streamed_reasoning_detail_text(rd) for rd in details) or None
+        from agent.reasoning_hygiene import degenerate_tail
+        if not isinstance(reasoning, str) or degenerate_tail(reasoning) is None:
+            return False
+        logger.warning(
+            "MiMo reasoning loop: degenerate reasoning in a completed response "
+            "(model=%s); dropping the reasoning and surfacing the loop notice.",
+            getattr(agent, "model", "unknown"))
+        with contextlib.suppress(Exception):
+            message.reasoning_content = None
+        with contextlib.suppress(Exception):
+            if getattr(message, "reasoning", None):
+                message.reasoning = None
+        with contextlib.suppress(Exception):
+            if getattr(message, "reasoning_details", None):
+                message.reasoning_details = None
+        if not (getattr(message, "content", None) or "").strip():
+            with contextlib.suppress(Exception):
+                message.content = REASONING_LOOP_ABORT_NOTICE
+        return True
+    except Exception:
+        # Post-hoc hygiene must never break a completed response's delivery;
+        # the replay trim still guards the wire on the next turn.
+        return False
+
+
 def _with_stream_emitters(agent, run):
     """Bracket ``run()`` with the agent's ``_emit_stream_start`` / ``_emit_stream_end``
     hooks when present (end carries the final text on success, the error string on
@@ -3152,6 +3236,10 @@ class _StreamingCall(StreamingWaitMonitor):
         base_timeout, read_timeout, conn_cap = self._stream_timeouts()
         content_parts: list = []
         reasoning_parts: list = []
+        # Live reasoning-loop guard (MiMo sessions only); resolved lazily at the
+        # first reasoning display text so non-reasoning models pay nothing.
+        _mimo_reasoning_guard = None
+        _loop_abort = False
         # Live-display accumulator for detail-derived reasoning text: de-gluing must
         # compare against what the display actually received, not ``reasoning_parts``
         # (a provider that mirrors the same text in both fields would otherwise read
@@ -3278,6 +3366,45 @@ class _StreamingCall(StreamingWaitMonitor):
             display_reasoning = detail_text or reasoning_text
             if display_reasoning:
                 self._emit_reasoning(display_reasoning)
+                # One canonical, deduplicated reasoning stream into the live guard:
+                # display_reasoning is exactly ONE representation per chunk (details
+                # when present, else the plain delta), so details-only streams are
+                # covered and mirrored text is never double-counted.
+                if _mimo_reasoning_guard is None:
+                    from agent.reasoning_hygiene import ReasoningLoopGuard
+                    _mimo_reasoning_guard = (
+                        ReasoningLoopGuard() if self.agent._needs_mimo_tool_reasoning() else False
+                    )
+                if _mimo_reasoning_guard and _mimo_reasoning_guard.feed(display_reasoning):
+                    # Degenerate reasoning attractor (exact tail cycle): explicit
+                    # detector-aborted outcome. Discard the accumulated reasoning NOW —
+                    # the aborted turn must never persist the loop text — and close the
+                    # stream to stop upstream generation. NO interrupt flag is set: the
+                    # abort response below is the turn's terminal answer and must be
+                    # DELIVERED by _StreamingCall.run() (setting _interrupt_requested
+                    # would make run() discard it as a user interruption). Terminality
+                    # comes from the response itself (finish stop, no tool calls, no
+                    # retryable error); a genuine user interrupt (monitor or flag,
+                    # which run() checks first) still outranks the detector.
+                    logger.warning(
+                        "MiMo reasoning loop guard: degenerate tail cycle detected "
+                        "(model=%s); aborting the turn.",
+                        self.api_kwargs.get("model", "unknown"))
+                    _diag["reasoning_loop_abort"] = True
+                    _loop_abort = True
+                    reasoning_parts.clear()
+                    detail_display_parts.clear()
+                    try:
+                        stream.close()
+                    except Exception:
+                        # Still checked out: poison the slot so the finally really closes the pool.
+                        if self._attempt_request_client is not None:
+                            self.agent._abort_request_openai_client(
+                                self._attempt_request_client, reason="reasoning_loop_close_failed")
+                    break
+                # Upstream's generic runaway watch (all models): fuzzy repetition on the
+                # raw reasoning channels. Ordered after the MiMo exact-cycle guard so
+                # MiMo keeps its precise terminal-abort path when both would trip.
                 if reasoning_watch.feed(reasoning_text) or detail_watch.feed(detail_text):
                     runaway = "reasoning"
                     break
@@ -3329,6 +3456,15 @@ class _StreamingCall(StreamingWaitMonitor):
         self._close_managed_stream()
         if self._stream_attempt_was_cancelled(stream_attempt_id):
             raise _httpx.RemoteProtocolError(f"stream attempt {stream_attempt_id} was superseded")
+        if _loop_abort:
+            # Explicit detector-aborted outcome: ONE terminal response carrying
+            # the user-visible reason — no success-then-interrupt race, no
+            # retries (a completed response, not an error), no partial tool
+            # calls (this response carries none), and no persisted reasoning
+            # (cleared at abort). Same notice voice as agent.repetition_guard's
+            # content-loop abort. run() delivers it like any completed turn;
+            # a genuine user interrupt still raises there first.
+            return _reasoning_loop_abort_response(role, model_name, usage_obj)
         if stream.final_response is not None:
             return self._adopt_final_response(stream.final_response)
         response = self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
@@ -3357,6 +3493,9 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _replay_final_response(self, final_response):
         """Replay a completed chat-completions response's reasoning/content as deltas."""
+        # Streaming-adopted final responses bypass interruptible_api_call's post-hoc
+        # check; run it here too (idempotent) so every completed response is covered.
+        _sanitize_completed_response_reasoning(self.agent, final_response)
         choices = final_response.choices
         message = getattr(choices[0] if isinstance(choices, (list, tuple)) and choices else None, "message", None)
         if message is not None:
