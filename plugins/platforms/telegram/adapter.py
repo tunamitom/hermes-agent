@@ -5504,7 +5504,30 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                                             and thread_id is not None and getattr(replied, "message_id", None) == thread_id):
             return False
         reply_user = getattr(replied, "from_user", None)
-        return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
+        if not (reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None)):
+            return False
+        # Forum-topic artifact: messages in a topic arrive anchored to the topic-root message
+        # (its message_id == message_thread_id). When the bot opened the topic that anchor is the
+        # bot's own post, so WITHOUT this filter every threaded message reads as "reply to the bot"
+        # and wakes it (seen live: topic chatter under a bot-opened topic triggered replies).
+        # A partial quote (TextQuote) is a deliberate address and still counts.
+        quote = getattr(message, "quote", None)
+        if quote is not None and getattr(quote, "text", None):
+            return True
+        reply_id = getattr(replied, "message_id", None)
+        if reply_id is not None and thread_id is not None and reply_id == thread_id:
+            # Narrowed to genuine topic anchors: a plain group reply carries the replied-to id as a
+            # reply-UI ``message_thread_id`` (see ``_effective_message_thread_id``) — that id
+            # coincidence is not a topic root, and the reply is a real address (upstream pin:
+            # tests/gateway/test_telegram_group_gating.py::test_non_forum_reply_anchor_to_bot_still_bypasses_mention_gate).
+            chat = getattr(message, "chat", None)
+            if chat is not None:
+                in_topic = bool(getattr(message, "is_topic_message", False)) or (
+                    self._chat_type_str(chat) in ("group", "supergroup") and getattr(chat, "is_forum", False) is True)
+                if not in_topic:
+                    return True
+            return False
+        return True
 
     _entity_sources = staticmethod(addressing_sources)  # telegram_entities.py: text, caption, or rich blocks
 
@@ -5914,7 +5937,9 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
             return False
         if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
             return True
-        if not self._telegram_require_mention() or self._is_reply_to_bot(message):
+        if not self._telegram_require_mention():
+            return True
+        if self._is_reply_to_bot(message):
             return True
         if self._message_mentions_bot(message):  # guest-mode group mentions already returned above
             return True
