@@ -5980,7 +5980,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if not self._bot or not getattr(message, "reply_to_message", None):
             return False
         reply_user = getattr(message.reply_to_message, "from_user", None)
-        return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
+        if not (reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None)):
+            return False
+        # Forum-topic artifact: messages in a topic arrive anchored to the topic-root message
+        # (its message_id == message_thread_id). When the bot opened the topic that anchor is the
+        # bot's own post, so WITHOUT this filter every threaded message reads as "reply to the bot"
+        # and wakes it (seen live: topic chatter under a bot-opened topic triggered replies).
+        # A partial quote (TextQuote) is a deliberate address and still counts.
+        quote = getattr(message, "quote", None)
+        if quote is not None and getattr(quote, "text", None):
+            return True
+        reply_id = getattr(message.reply_to_message, "message_id", None)
+        thread_id = getattr(message, "message_thread_id", None)
+        if reply_id is not None and thread_id is not None and reply_id == thread_id:
+            return False
+        return True
 
     @staticmethod
     def _entity_sources(message: Message):
@@ -6436,7 +6450,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # plain chatter does not count (two bots answering each other's replies never stop otherwise).
         if self._bot_sender_suppressed(message):
             return False
-        if not self._telegram_require_mention() or self._is_reply_to_bot(message):
+        if not self._telegram_require_mention():
+            return True
+        if self._is_reply_to_bot(message):
             return True
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
             return True
