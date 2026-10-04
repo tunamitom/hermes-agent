@@ -5760,6 +5760,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         """Return whether group chats should require an explicit bot trigger."""
         return self._extra_bool("require_mention", "TELEGRAM_REQUIRE_MENTION", "false")
 
+    def _telegram_reply_to_bot_triggers(self) -> bool:
+        """Whether a quote-reply to the bot's own message counts as addressing it in groups.
+        Off = strict @mention only (Discord's ``bots_require_inline_mention`` semantics): threaded
+        chatter under a bot post (e.g. replies to a topic-root card) no longer wakes the bot."""
+        return self._extra_bool("reply_to_bot_triggers", "TELEGRAM_REPLY_TO_BOT_TRIGGERS", "true")
+
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Store skipped unmentioned group messages as context (observe chatter, dispatch only when addressed)."""
         return self._extra_bool(
@@ -5956,7 +5962,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not self._bot or not getattr(message, "reply_to_message", None):
             return False
         reply_user = getattr(message.reply_to_message, "from_user", None)
-        return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
+        if not (reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None)):
+            return False
+        # Forum-topic artifact: messages in a topic arrive anchored to the topic-root message
+        # (its message_id == message_thread_id). When the bot opened the topic that anchor is the
+        # bot's own post, so WITHOUT this filter every threaded message reads as "reply to the bot"
+        # and wakes it (seen live: topic chatter under a bot-opened topic triggered replies).
+        # A partial quote (TextQuote) is a deliberate address and still counts.
+        quote = getattr(message, "quote", None)
+        if quote is not None and getattr(quote, "text", None):
+            return True
+        reply_id = getattr(message.reply_to_message, "message_id", None)
+        thread_id = getattr(message, "message_thread_id", None)
+        if reply_id is not None and thread_id is not None and reply_id == thread_id:
+            return False
+        return True
 
     @staticmethod
     def _entity_sources(message: Message):
@@ -6412,7 +6432,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # plain chatter does not count (two bots answering each other's replies never stop otherwise).
         if self._bot_sender_suppressed(message):
             return False
-        if not self._telegram_require_mention() or self._is_reply_to_bot(message):
+        if not self._telegram_require_mention():
+            return True
+        if self._telegram_reply_to_bot_triggers() and self._is_reply_to_bot(message):
             return True
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
             return True
