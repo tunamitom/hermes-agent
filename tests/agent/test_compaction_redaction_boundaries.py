@@ -17,6 +17,7 @@ the persistence boundary, and uses an OAuth-callback-style URL to prove
 redaction deliberately passes through.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -70,6 +71,23 @@ def test_helper_is_strict_even_when_redaction_disabled():
     _assert_clean(result)
     # None-safety: helper is used on optional fields.
     assert _redact_compaction_text(None) == ""
+
+
+def test_inline_image_data_url_survives_compaction_redaction():
+    # A valid base64 payload whose eyJ... prefix is JWT-shaped and used to become "***+AB".
+    image_url = "data:image/png;base64,eyJabcdefghij+AB"
+    history = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": f"token {SECRET} url {OAUTH_URL}"},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ],
+    }]
+
+    redacted = _redact_compaction_text(json.dumps(history))
+
+    assert image_url in redacted
+    _assert_clean(redacted)
 
 
 def test_serializer_input_redacts_content_and_tool_args():

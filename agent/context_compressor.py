@@ -1165,11 +1165,35 @@ _HISTORICAL_TASK_SECTION_RE = re.compile(
 )
 
 
+_INLINE_BASE64_DATA_URL_RE = re.compile(
+    r"data:[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+"
+    r"(?:;[A-Za-z0-9!#$&^_.+-]+=[^;,\s\"'<>]+)*;base64,"
+    r"[A-Za-z0-9+/=_%-]+",
+    re.IGNORECASE,
+)
+
+
 def _redact_compaction_text(text: Any) -> str:
-    """Redact text that crosses a compaction summary boundary (strict mode).
+    """Strictly redact compaction text without altering embedded binary data URLs.
+
     ``force=True`` overrides ``security.redact_secrets: false``; URL credentials are redacted too, since
-    summaries persist and re-enter every later prompt."""
-    return redact_sensitive_text(text or "", force=True, redact_url_credentials=True)
+    summaries persist and re-enter every later prompt. Base64 payloads are opaque bytes, not text secrets:
+    a credential-shaped substring must never be masked inside one.
+    """
+    data_urls: list[str] = []
+    placeholder = "HERMES_COMPACTION_DATA_URL"
+    while isinstance(text, str) and placeholder in text:
+        placeholder = f"_{placeholder}_"
+
+    def _preserve_data_url(match: re.Match[str]) -> str:
+        data_urls.append(match.group(0))
+        return f"{placeholder}_{len(data_urls) - 1}"
+
+    protected = _INLINE_BASE64_DATA_URL_RE.sub(_preserve_data_url, text) if isinstance(text, str) else text
+    redacted = redact_sensitive_text(protected or "", force=True, redact_url_credentials=True)
+    for index, data_url in enumerate(data_urls):
+        redacted = redacted.replace(f"{placeholder}_{index}", data_url)
+    return redacted
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
